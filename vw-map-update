@@ -1,0 +1,191 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i bash -p p7zip util-linux coreutils
+set -euo pipefail
+
+# Configuration
+DOWNLOAD_DIR="$HOME/Downloads"
+EXTRACT_DIR="$DOWNLOAD_DIR/maps"
+REGIONS_TO_DELETE=("E3" "E8" "E10")  # Modify as needed
+SD_CARD_LABEL="SD_CARD"  # Change to match your SD card label
+TARGET_SIZE_GB=16
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Find the latest .7z file
+find_latest_archive() {
+    local archive=$(find "$DOWNLOAD_DIR" -maxdepth 1 -name "*.7z" -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+    if [[ -z "$archive" ]]; then
+        log_error "No .7z archive found in $DOWNLOAD_DIR"
+        exit 1
+    fi
+    echo "$archive"
+}
+
+# Extract archive
+extract_archive() {
+    local archive="$1"
+    log_info "Extracting $(basename "$archive")..."
+    
+    # Remove old extraction
+    if [[ -d "$EXTRACT_DIR" ]]; then
+        log_warn "Removing old extracted data..."
+        rm -rf "$EXTRACT_DIR"
+    fi
+    
+    cd "$DOWNLOAD_DIR"
+    7za x "$(basename "$archive")"
+    
+    if [[ ! -d "$EXTRACT_DIR/00/nds/PRODUCT" ]]; then
+        log_error "Expected directory structure not found after extraction"
+        exit 1
+    fi
+}
+
+# Show region sizes
+show_regions() {
+    log_info "Current regions and sizes:"
+    du -sh "$EXTRACT_DIR/00/nds/PRODUCT"/E* 2>/dev/null | sort -hr
+    echo
+    log_info "Total size:"
+    du -sh "$EXTRACT_DIR"
+}
+
+# Delete unwanted regions
+delete_regions() {
+    local product_dir="$EXTRACT_DIR/00/nds/PRODUCT"
+    
+    log_info "Deleting unwanted regions: ${REGIONS_TO_DELETE[*]}"
+    
+    for region in "${REGIONS_TO_DELETE[@]}"; do
+        if [[ -d "$product_dir/$region" ]]; then
+            log_info "Deleting $region..."
+            rm -rf "$product_dir/$region"
+        else
+            log_warn "Region $region not found, skipping"
+        fi
+    done
+    
+    echo
+    log_info "Remaining regions:"
+    ls -d "$product_dir"/E* 2>/dev/null || log_warn "No regions found"
+    echo
+    log_info "New total size:"
+    du -sh "$EXTRACT_DIR"
+}
+
+# Find and mount SD card
+mount_sd_card() {
+    log_info "Looking for SD card..."
+    
+    # Try to find by label first
+    local sd_device=$(lsblk -no PATH,LABEL | grep -i "$SD_CARD_LABEL" | awk '{print $1}' | head -1)
+    
+    # If not found by label, show available devices
+    if [[ -z "$sd_device" ]]; then
+        log_warn "SD card with label '$SD_CARD_LABEL' not found"
+        echo
+        echo "Available removable devices:"
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,LABEL | grep -E "disk|part"
+        echo
+        read -p "Enter device path (e.g., /dev/sdb1): " sd_device
+    fi
+    
+    # Check if already mounted
+    local mount_point=$(lsblk -no MOUNTPOINT "$sd_device" 2>/dev/null)
+    
+    if [[ -n "$mount_point" ]]; then
+        log_info "SD card already mounted at $mount_point"
+        echo "$mount_point"
+        return
+    fi
+    
+    # Mount it
+    mount_point="/run/media/$USER/$(basename "$sd_device")"
+    log_info "Mounting $sd_device to $mount_point..."
+    sudo mkdir -p "$mount_point"
+    sudo mount "$sd_device" "$mount_point"
+    echo "$mount_point"
+}
+
+# Copy to SD card
+copy_to_sd() {
+    local mount_point="$1"
+    
+    log_info "Removing old map data from SD card..."
+    sudo rm -rf "$mount_point/maps" 2>/dev/null || true
+    
+    log_info "Copying new map data to SD card..."
+    sudo cp -r "$EXTRACT_DIR" "$mount_point/"
+    
+    log_info "Syncing filesystem..."
+    sync
+    
+    log_info "Final size on SD card:"
+    du -sh "$mount_point/maps"
+}
+
+# Main execution
+main() {
+    log_info "Starting VW Map Update Process"
+    echo
+    
+    # Step 1: Find archive
+    ARCHIVE=$(find_latest_archive)
+    log_info "Found archive: $(basename "$ARCHIVE")"
+    echo
+    
+    # Step 2: Extract
+    extract_archive "$ARCHIVE"
+    echo
+    
+    # Step 3: Show regions before deletion
+    show_regions
+    echo
+    
+    # Step 4: Confirm deletion
+    read -p "Delete regions ${REGIONS_TO_DELETE[*]}? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log_warn "Aborted by user"
+        exit 0
+    fi
+    
+    # Step 5: Delete regions
+    delete_regions
+    echo
+    
+    # Step 6: Mount SD card
+    MOUNT_POINT=$(mount_sd_card)
+    echo
+    
+    # Step 7: Confirm copy
+    read -p "Copy to SD card at $MOUNT_POINT? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log_warn "Copy cancelled by user"
+        exit 0
+    fi
+    
+    # Step 8: Copy to SD
+    copy_to_sd "$MOUNT_POINT"
+    echo
+    
+    log_info "✓ Update complete! You can now safely eject the SD card."
+}
+
+# Run main function
+main "$@"

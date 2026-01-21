@@ -1,0 +1,9 @@
+# Downloaded archives
+*.7z
+
+# Extracted map data
+maps/
+
+# Nix build artifacts
+result
+result-*
